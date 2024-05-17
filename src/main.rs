@@ -51,7 +51,7 @@ async fn process_input(input: String, ips: Arc<Vec<String>>, ports: Arc<Vec<Stri
             
         }
     };
-    if this_ip.len() == 0{
+    if this_ip.trim().len() == 0{
         ()
     }
     let allow_print_ports = ports.len() != 0;
