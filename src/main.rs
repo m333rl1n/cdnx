@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::process::exit;
-use std::{error::Error, fs::File, io::{self, BufRead}};
-use std::{env, vec};
+use std::{error::Error, fs::File,fs::create_dir_all, io::{self, BufRead}};
+use std::env;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use regex::Regex;
@@ -10,13 +10,17 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::channel;
 use std::net::IpAddr;
 use reqwest::Client;
-use std::fs::create_dir_all;
 use ipnetwork::IpNetwork;
 use std::sync::Arc;
 use tokio;
 use trust_dns_resolver::{AsyncResolver, config::{ResolverConfig, ResolverOpts}};
-use simplelog::*;
-use log::{error, info, warn};
+use clap::{Arg, Command, ArgAction};
+
+// ANSI escape codes
+const BLUE: &str = "\x1b[34m"; 
+const RED: &str = "\x1b[31m"; 
+const YELLOW: &str = "\x1b[33m"; 
+const RESET: &str = "\x1b[0m"; 
 
 const IPV4_CIDR_REGEX: &str = r#"(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(/(3[0-2]|[1-2][0-9]|[0-9]))"#;
 const CONTENT: &str = r#"Providers:
@@ -35,6 +39,15 @@ Interval: 172800
 
 # TODO:  use custom DNS server
 "#;
+
+
+fn logger(color: &str, sign: &str, msg: &str) {
+    writeln!(io::stderr(), "[{}{}{RESET}] {}", color, sign, msg).unwrap();
+}
+
+macro_rules! error { ($msg:expr) => {logger(RED, "#", &$msg)}; }
+macro_rules! info { ($msg:expr) => {logger(BLUE, "+", &$msg)}; }
+macro_rules! warn { ($msg:expr) => {logger(YELLOW, "!", &$msg)}; }
 
 
 async fn process_input(input: String, ips: Arc<Vec<String>>, ports: Arc<Vec<String>>, resolver: AsyncResolver<trust_dns_resolver::name_server::GenericConnection, trust_dns_resolver::name_server::GenericConnectionProvider<trust_dns_resolver::name_server::TokioRuntime>>, append: bool) -> () {
@@ -113,13 +126,11 @@ async fn fetch_new_data(providers: &Value, path: &Path) -> Vec<String>{
                                 cx_clone.send(c).await.unwrap();
 
                             }
-                            info!("{url} DONE");
-                            
                         } else {
-                            warn!("Failed to fetch {} with status {}", url, response.status());
+                            warn!(format!("Failed to fetch {} with status {}", url, response.status()));
                         }
                     },
-                    Err(_) => warn!("Failed to fetch {}", url),
+                    Err(_) => warn!(format!("Failed to fetch {url}")),
                 }
                 // drop(cx_clone);
             }
@@ -222,7 +233,6 @@ async fn load_configs() -> Result<Vec<String>, Box<dyn Error>> {
     
 }
 
-use clap::{Arg, Command, ArgAction};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -239,21 +249,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut ports: Vec<String> = Vec::new();
     let append = app.clone().get_flag("append");
+
     if let Some(p) = app.get_many::<String>("ports"){
         ports = p.collect::<Vec<_>>().iter().map(|f| f.to_string()).collect();
     }
-    
-    let config = ConfigBuilder::new()
-        .set_time_level(LevelFilter::Off)
-        .set_thread_level(LevelFilter::Off)
-        .set_target_level(LevelFilter::Off)
-        .build();
-
-    CombinedLogger::init(
-        vec![
-            TermLogger::new(LevelFilter::Info, config, TerminalMode::Stderr, ColorChoice::Auto),
-        ]
-    ).unwrap();
 
     let resolver_config = ResolverConfig::default();
     let resolver_opts = ResolverOpts::default();
