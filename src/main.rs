@@ -4,17 +4,13 @@ use regex::Regex;
 use reqwest::Client;
 use serde_yaml::{self, Value};
 use std::env;
-use std::io::{self,BufRead,Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use std::{
-    error::Error,
-    fs::create_dir_all,
-    fs::File,
-};
+use std::{error::Error, fs::create_dir_all, fs::File};
 use tokio;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::channel;
@@ -83,14 +79,14 @@ async fn process_input(
         Ok(_ip) => input.clone(),
         Err(_) => {
             // Lookup the IP addresses associated with a name.
-            match resolver.lookup_ip(&input).await {
+            match resolver.ipv4_lookup(&(input.clone().trim_end_matches('.').to_owned() + ".")).await {
                 Ok(lookup_result) => lookup_result.iter().next().unwrap().to_string(),
                 Err(_) => "".to_owned(),
             }
         }
     };
-    if this_ip.trim().len() == 0 {
-        ()
+    if this_ip.trim().is_empty() {
+        return ();
     }
     let allow_print_ports = ports.len() != 0;
 
@@ -98,6 +94,8 @@ async fn process_input(
         if allow_print_ports && append {
             println!("{input}:80");
             println!("{input}:443");
+        } else if append {
+            println!("{input}");
         }
     } else {
         if !allow_print_ports {
@@ -152,6 +150,7 @@ async fn fetch_new_data(providers: &Value, path: &Path) -> Vec<String> {
                             let c = cidr.get(0).unwrap().as_str().to_string();
                             cx_clone.send(c).await.unwrap();
                         }
+                        info!(format!("{url} DONE"));
                     } else {
                         warn!(format!(
                             "Failed to fetch {} with status {}",
@@ -294,19 +293,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let stdin_lock = io::stdin().lock();
 
     for line in stdin_lock.lines() {
-        let port_copy = ports.clone();
-        let ips_copy = ips.clone();
         let domain = line?;
-        let resolver_clone = resolver.clone();
-
-        let handle = tokio::spawn(process_input(
-            domain,
-            ips_copy,
-            port_copy,
-            resolver_clone,
-            append,
-        ));
-
+        let handle = tokio::task::spawn( {
+            process_input(domain, Arc::clone(&ips),  Arc::clone(&ports) , resolver.clone(),append)
+        });
+        
         // Store the task handle in the vector
         handles.push(handle);
     }
