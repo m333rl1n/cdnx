@@ -1,19 +1,20 @@
-use clap::{Arg, ArgAction, Command};
-use ipnetwork::IpNetwork;
+use clap::Parser;
 use regex::Regex;
 use reqwest::Client;
 use serde_yaml::{self, Value};
 use std::env;
 use std::io::{self, BufRead, Read, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use std::{error::Error, fs::create_dir_all, fs::File};
 use tokio;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::channel;
+use tokio::task::JoinSet;
 use trust_dns_resolver::{
     config::{ResolverConfig, ResolverOpts},
     AsyncResolver,
@@ -43,6 +44,25 @@ Interval: 172800
 # TODO:  use custom DNS server
 "#;
 
+#[derive(Parser, Debug)]
+#[command(long_about = None)]
+struct Args {
+    /// Comma-sperated ports (e.g 80,443,8000)
+    ports: Option<String>,
+
+    /// Number of threads
+    #[arg(short, default_value_t = 100)]
+    thread: usize,
+
+    /// Append CDN hosts
+    #[arg(short, default_value_t = false)]
+    append: bool,
+
+    /// Do not print any message
+    #[arg(short, default_value_t = false)]
+    quit: bool,
+}
+
 fn logger(color: &str, sign: &str, msg: &str) {
     writeln!(io::stderr(), "[{}{}{RESET}] {}", color, sign, msg).unwrap();
 }
@@ -63,68 +83,12 @@ macro_rules! warn {
     };
 }
 
-async fn process_input(
-    input: String,
-    ips: Arc<Vec<String>>,
-    ports: Arc<Vec<String>>,
-    resolver: AsyncResolver<
-        trust_dns_resolver::name_server::GenericConnection,
-        trust_dns_resolver::name_server::GenericConnectionProvider<
-            trust_dns_resolver::name_server::TokioRuntime,
-        >,
-    >,
-    append: bool,
-) -> () {
-    let this_ip = match input.parse::<IpAddr>() {
-        Ok(_ip) => input.clone(),
-        Err(_) => {
-            // Lookup the IP addresses associated with a name.
-            match resolver.ipv4_lookup(&(input.clone().trim_end_matches('.').to_owned() + ".")).await {
-                Ok(lookup_result) => lookup_result.iter().next().unwrap().to_string(),
-                Err(_) => "".to_owned(),
-            }
-        }
-    };
-    if this_ip.trim().is_empty() {
-        return ();
-    }
-    let allow_print_ports = ports.len() != 0;
-
-    if ips.contains(&this_ip) {
-        if allow_print_ports && append {
-            println!("{input}:80");
-            println!("{input}:443");
-        } else if append {
-            println!("{input}");
-        }
-    } else {
-        if !allow_print_ports {
-            println!("{input}");
-        } else {
-            for port in ports.iter() {
-                println!("{input}:{port}")
-            }
-        }
-    }
-}
-
-/// Convert a list of CIDRs to a of IPs
-fn cidr_to_ip(list: Vec<&str>) -> Vec<String> {
-    let mut ips: Vec<String> = vec![];
-    for item in list.into_iter() {
-        let cidr_ips: IpNetwork = item.parse().unwrap();
-        for ip in cidr_ips.into_iter() {
-            ips.push(ip.to_string());
-        }
-    }
-    ips
-}
-
 /// Fetch new CIDRs from providers
-async fn fetch_new_data(providers: &Value, path: &Path) -> Vec<String> {
+async fn fetch_new_data(providers: &Value, path: &Path, quit: bool) -> Result<(), Box<dyn Error>> {
     let reg = Regex::new(IPV4_CIDR_REGEX).unwrap();
-    let mut result: Vec<String> = vec![];
-    info!("Fetch new data...");
+    if !quit{
+        info!("Fetch new data...");
+    }
     let mut handles = vec![];
     let (cx, mut rx) = channel(100);
     let client = Client::builder()
@@ -150,51 +114,47 @@ async fn fetch_new_data(providers: &Value, path: &Path) -> Vec<String> {
                             let c = cidr.get(0).unwrap().as_str().to_string();
                             cx_clone.send(c).await.unwrap();
                         }
-                        info!(format!("{url} DONE"));
+
+                        if !quit {
+                            info!(format!("{url} DONE"));
+                        }
                     } else {
-                        warn!(format!(
-                            "Failed to fetch {} with status {}",
-                            url,
-                            response.status()
-                        ));
+                        if !quit {
+                            warn!(format!(
+                                "Failed to fetch {} with status {}",
+                                url,
+                                response.status()
+                            ));
+                        }
                     }
                 }
-                Err(_) => warn!(format!("Failed to fetch {url}")),
+                Err(_) => {
+                    if !quit {
+                        warn!(format!("Failed to fetch {url}"))
+                    }
+                }
             }
-            // drop(cx_clone);
         });
         handles.push(handle);
     }
 
+    let mut file: tokio::fs::File = tokio::fs::File::create(path).await.unwrap();
+    let mut is_err = true;
     drop(cx);
-
     while let Some(i) = rx.recv().await {
-        result.push(i);
+        is_err = false;
+        let _ = file.write_all(format!("{i}\n").as_bytes()).await;
     }
 
-    if result.len() == 0 {
+    if is_err {
         error!("Could't fetch any CIDR :(");
         exit(1);
     }
 
-    let mut file = tokio::fs::File::create(path).await.unwrap();
-    for i in result.clone().iter() {
-        let _ = file.write_all(format!("{i}\n").as_bytes()).await;
-    }
-    cidr_to_ip(result.iter().map(|f| f.as_str()).collect())
+    Ok(())
 }
 
-/// Read CIDRs from "~/.config/cdnx/cidr.txt" and return list of IPs
-fn load_cidr(path: &Path) -> Vec<String> {
-    let mut buffer = String::new();
-    let mut file = File::open(path).unwrap();
-    let _ = file.read_to_string(&mut buffer);
-
-    let data: Vec<&str> = buffer.trim().lines().collect();
-    cidr_to_ip(data)
-}
-
-async fn load_configs() -> Result<Vec<String>, Box<dyn Error>> {
+async fn check_updates(quit: bool) -> Result<(), Box<dyn Error>> {
     let config_dir = PathBuf::from(env::var("HOME").unwrap() + "/.config/cdnx");
     let config_file_path = config_dir.join("config.yaml");
     let cidr_file_path = config_dir.join("cidr.txt");
@@ -229,16 +189,10 @@ async fn load_configs() -> Result<Vec<String>, Box<dyn Error>> {
             let gap = now.duration_since(modified_time).unwrap();
 
             // if time passed from last update was lower than 2 days
-            if gap.as_secs() < interval {
-                // load CIDRs from "~/.config/cdnx/cidr.txt"
-                Ok(load_cidr(cidr_file_path.as_path()))
-            } else {
+            if gap.as_secs() > interval {
                 // fetch new data from providers
-                Ok(fetch_new_data(&providers.unwrap(), &cidr_file_path).await)
+                fetch_new_data(&providers.unwrap(), &cidr_file_path, quit).await?;
             }
-        } else {
-            // fetch new data from providers
-            Ok(fetch_new_data(&providers.unwrap(), &cidr_file_path).await)
         }
     } else {
         //create "~/.config/cdnx"
@@ -252,58 +206,135 @@ async fn load_configs() -> Result<Vec<String>, Box<dyn Error>> {
         providers = Some(yaml_data.get("Providers").unwrap());
 
         // fetch new data from providers
-        Ok(fetch_new_data(&providers.unwrap(), &cidr_file_path).await)
+        fetch_new_data(&providers.unwrap(), &cidr_file_path, quit).await?;
     }
+    Ok(())
+}
+
+fn is_cdn(cidrs: &Vec<String>, ip: &str) -> bool {
+    for cidr_str in cidrs {
+        if let Ok((network_ip, prefix_len)) = parse_cidr(&cidr_str) {
+            if let Ok(ip) = ip.parse::<Ipv4Addr>() {
+                let is_in_range = is_ip_in_cidr(ip, network_ip, prefix_len);
+                if is_in_range {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn parse_cidr(cidr: &str) -> Result<(Ipv4Addr, u8), Box<dyn std::error::Error>> {
+    let parts: Vec<&str> = cidr.split('/').collect();
+    if parts.len() != 2 {
+        return Err("Invalid CIDR format".into());
+    }
+
+    let ip = Ipv4Addr::from_str(parts[0])?;
+    let prefix_len: u8 = parts[1].parse()?;
+
+    if prefix_len > 32 {
+        return Err("Prefix length must be between 0 and 32".into());
+    }
+
+    Ok((ip, prefix_len))
+}
+
+fn ipv4_to_u32(ip: Ipv4Addr) -> u32 {
+    u32::from(ip)
+}
+
+fn is_ip_in_cidr(ip: Ipv4Addr, network_ip: Ipv4Addr, prefix_len: u8) -> bool {
+    let ip_u32 = ipv4_to_u32(ip);
+    let network_ip_u32 = ipv4_to_u32(network_ip);
+    let netmask_u32 = !0u32 << (32 - prefix_len);
+    (ip_u32 & netmask_u32) == (network_ip_u32 & netmask_u32)
+}
+
+fn read_cidrs() -> Vec<String> {
+    let path = PathBuf::from(env::var("HOME").unwrap() + "/.config/cdnx").join("cidr.txt");
+
+    let mut buffer = String::new();
+    let mut file = File::open(path).unwrap();
+    let _ = file.read_to_string(&mut buffer);
+
+    let data: Vec<String> = buffer
+        .trim()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .collect();
+    data
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let app = Command::new("cdnx")
-        .arg(
-            Arg::new("ports")
-                .help("Comma-sperated ports (e.g 80,443,8000)")
-                .value_delimiter(','),
-        )
-        .arg(
-            Arg::new("append")
-                .short('a')
-                .help("Append CDN hosts")
-                .action(ArgAction::SetTrue),
-        )
-        .get_matches();
-
+    let args = Args::parse();
     let mut ports: Vec<String> = Vec::new();
-    let append = app.clone().get_flag("append");
+    let append = args.append;
+    let max_concurrent = args.thread;
 
-    if let Some(p) = app.get_many::<String>("ports") {
-        ports = p
-            .collect::<Vec<_>>()
-            .iter()
-            .map(|f| f.to_string())
-            .collect();
+    if let Some(p) = args.ports {
+        ports = p.split(',').map(|p| p.to_string()).collect();
     }
+    let allow_print_ports = ports.len() != 0;
 
     let resolver_config = ResolverConfig::default();
     let resolver_opts = ResolverOpts::default();
-    let resolver = AsyncResolver::tokio(resolver_config, resolver_opts)?;
+    let resolver = Arc::from(AsyncResolver::tokio(resolver_config, resolver_opts)?);
 
-    let ports: Arc<Vec<String>> = Arc::from(ports.clone());
-    let ips: Arc<Vec<String>> = Arc::from(load_configs().await?);
-    let mut handles = vec![];
+    check_updates(args.quit).await?;
+    let ip_ranges: Arc<Vec<String>> = Arc::from(read_cidrs());
+
     let stdin_lock = io::stdin().lock();
+    let mut join_set = JoinSet::new();
 
     for line in stdin_lock.lines() {
         let domain = line?;
-        let handle = tokio::task::spawn( {
-            process_input(domain, Arc::clone(&ips),  Arc::clone(&ports) , resolver.clone(),append)
+        let resolver_tmp = resolver.clone();
+        let ip_ranges_tmp = ip_ranges.clone();
+        let ports_tmp = ports.clone();
+
+        while join_set.len() >= max_concurrent {
+            join_set.join_next().await.unwrap().unwrap();
+        }
+
+        join_set.spawn(async move {
+            let this_ip = match domain.parse::<IpAddr>() {
+                Ok(__) => domain.clone(),
+                Err(_) => match resolver_tmp
+                    .ipv4_lookup(&(domain.clone().trim_end_matches('.').to_owned() + "."))
+                    .await
+                {
+                    Ok(lookup_result) => lookup_result.iter().next().unwrap().to_string(),
+                    Err(_) => "".to_string(),
+                },
+            };
+            if this_ip.is_empty() {
+                return ();
+            }
+            let is_this_cdn = is_cdn(&ip_ranges_tmp, &this_ip);
+
+            if !allow_print_ports && ((is_this_cdn && append) || (!is_this_cdn)) {
+                println!("{domain}");
+                return ();
+            }
+
+            if is_this_cdn && append {
+                println!("{domain}:80");
+                println!("{domain}:443");
+                return ();
+            }
+            if !is_this_cdn {
+                for port in ports_tmp.iter() {
+                    println!("{domain}:{port}")
+                }
+            }
         });
-        
-        // Store the task handle in the vector
-        handles.push(handle);
     }
 
-    for handle in handles {
-        let _ = handle.await;
+    while let Some(output) = join_set.join_next().await {
+        output.unwrap();
     }
 
     Ok(())
