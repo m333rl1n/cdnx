@@ -37,6 +37,7 @@ const CONTENT: &str = r#"Providers:
     - http://edge.sotoon.ir/ip-list.json
     - https://docs.oracle.com/en-us/iaas/tools/public_ip_ranges.json
     - https://raw.githubusercontent.com/m333rl1n/cdnx/main/static-CIDRs.txt
+    - https://my.incapsula.com/api/integration/v1/ips
 
 # default interval is 2 day
 Interval: 172800
@@ -58,9 +59,9 @@ struct Args {
     #[arg(short, default_value_t = false)]
     append: bool,
 
-    /// Do not print any message
+    /// Verbose mode
     #[arg(short, default_value_t = false)]
-    quit: bool,
+    verbose: bool,
 }
 
 fn logger(color: &str, sign: &str, msg: &str) {
@@ -84,10 +85,10 @@ macro_rules! warn {
 }
 
 /// Fetch new CIDRs from providers
-async fn fetch_new_data(providers: &Value, path: &Path, quit: bool) -> Result<(), Box<dyn Error>> {
+async fn fetch_new_data(providers: &Value, path: &Path, verbose: bool) -> Result<(), Box<dyn Error>> {
     let reg = Regex::new(IPV4_CIDR_REGEX).unwrap();
-    if !quit{
-        info!("Fetch new data...");
+    if verbose {
+        info!("Updating ...");
     }
     let mut handles = vec![];
     let (cx, mut rx) = channel(100);
@@ -115,11 +116,12 @@ async fn fetch_new_data(providers: &Value, path: &Path, quit: bool) -> Result<()
                             cx_clone.send(c).await.unwrap();
                         }
 
-                        if !quit {
+                        if verbose {
                             info!(format!("{url} DONE"));
                         }
+
                     } else {
-                        if !quit {
+                        if verbose {
                             warn!(format!(
                                 "Failed to fetch {} with status {}",
                                 url,
@@ -129,12 +131,13 @@ async fn fetch_new_data(providers: &Value, path: &Path, quit: bool) -> Result<()
                     }
                 }
                 Err(_) => {
-                    if !quit {
+                    if verbose {
                         warn!(format!("Failed to fetch {url}"))
                     }
                 }
             }
         });
+
         handles.push(handle);
     }
 
@@ -149,12 +152,14 @@ async fn fetch_new_data(providers: &Value, path: &Path, quit: bool) -> Result<()
     if is_err {
         error!("Could't fetch any CIDR :(");
         exit(1);
+    } else if verbose {
+        info!("Updated successfully")
     }
 
     Ok(())
 }
 
-async fn check_updates(quit: bool) -> Result<(), Box<dyn Error>> {
+async fn check_updates(verbose: bool) -> Result<(), Box<dyn Error>> {
     let config_dir = PathBuf::from(env::var("HOME").unwrap() + "/.config/cdnx");
     let config_file_path = config_dir.join("config.yaml");
     let cidr_file_path = config_dir.join("cidr.txt");
@@ -191,7 +196,7 @@ async fn check_updates(quit: bool) -> Result<(), Box<dyn Error>> {
             // if time passed from last update was lower than 2 days
             if gap.as_secs() > interval {
                 // fetch new data from providers
-                fetch_new_data(&providers.unwrap(), &cidr_file_path, quit).await?;
+                fetch_new_data(&providers.unwrap(), &cidr_file_path, verbose).await?;
             }
         }
     } else {
@@ -206,7 +211,7 @@ async fn check_updates(quit: bool) -> Result<(), Box<dyn Error>> {
         providers = Some(yaml_data.get("Providers").unwrap());
 
         // fetch new data from providers
-        fetch_new_data(&providers.unwrap(), &cidr_file_path, quit).await?;
+        fetch_new_data(&providers.unwrap(), &cidr_file_path, verbose).await?;
     }
     Ok(())
 }
@@ -283,7 +288,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let resolver_opts = ResolverOpts::default();
     let resolver = Arc::from(AsyncResolver::tokio(resolver_config, resolver_opts)?);
 
-    check_updates(args.quit).await?;
+    check_updates(args.verbose).await?;
     let ip_ranges: Arc<Vec<String>> = Arc::from(read_cidrs());
 
     let stdin_lock = io::stdin().lock();
